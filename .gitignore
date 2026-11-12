@@ -1,0 +1,8 @@
+build/
+models/
+*.gguf
+*.o
+*.d
+*.exe
+*.vocab
+__pycache__/
