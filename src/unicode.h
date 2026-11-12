@@ -75,6 +75,20 @@ inline size_t utf8_decode(const char* s, size_t n, size_t i, uint32_t* out) {
     return need + 1;
 }
 
+// True when every byte sequence decodes to a real codepoint. A genuine U+FFFD
+// occupies three bytes, so a one-byte advance out of the decoder means garbage.
+inline bool utf8_valid(std::string_view s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        uint32_t cp = 0;
+        const size_t adv = utf8_decode(s.data(), s.size(), i, &cp);
+        if (adv == 0) return false;
+        if (cp == 0xFFFD && adv == 1) return false;
+        i += adv;
+    }
+    return true;
+}
+
 inline void utf8_append(std::string& out, uint32_t cp) {
     if (cp < 0x80) {
         out.push_back(static_cast<char>(cp));

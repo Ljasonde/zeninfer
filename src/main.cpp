@@ -321,6 +321,12 @@ int cmd_tokenize(const TokOpts& o) {
     }
 
     const std::string text = o.text_file.empty() ? unescape(o.text) : read_file(o.text_file);
+    if (o.text_file.empty() && !zen::utf8_valid(text)) {
+        std::fprintf(stderr,
+                     "warning: --text is not valid UTF-8, so the shell transcoded it "
+                     "(Windows PowerShell passes arguments in the OEM code page).\n"
+                     "         Use --text-file with a UTF-8 file for non-ASCII text.\n");
+    }
     if (o.spans) {
         const auto spans = zen::pretokenize(text);
         std::printf("%zu span(s) for %zu byte(s)\n", spans.size(), text.size());

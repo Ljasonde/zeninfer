@@ -46,6 +46,10 @@ zeninfer bench-tokenizer <model.gguf> <file> [--repeat N]
 `--json` on `inspect` emits a schema that `tools/dump_gguf.py --json` also produces, so the two
 independent implementations can be diffed tensor by tensor.
 
+> **Windows note.** PowerShell hands native arguments over in the OEM code page, so `--text "你好"`
+> arrives as mojibake bytes. The binary detects this and warns. Put the text in a UTF-8 file and use
+> `--text-file` instead.
+
 ## M1: what is verified
 
 Both halves of the front end are checked against independent implementations rather than against
