@@ -199,3 +199,7 @@ tools/gen_unicode_tables.py
 M3 KV cache, M4 AVX2 GEMM and threading, M5 quantization and its perplexity cost, M6 benchmark
 harness and an OpenAI-compatible endpoint. Numbers get published as they are measured; nothing
 here is an estimate dressed as a result.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
