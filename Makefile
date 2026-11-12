@@ -27,7 +27,7 @@ SRCS := $(wildcard $(SRC_DIR)/*.cpp)
 OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD)/%.o,$(SRCS))
 DEPS := $(OBJS:.o=.d)
 
-.PHONY: all clean test check
+.PHONY: all clean test check check-forward check-hf
 
 PYTHON ?= python
 
@@ -46,6 +46,24 @@ clean:
 
 test: $(BIN)
 	./$(BIN) inspect models/qwen2.5-0.5b-instruct-q8_0.gguf
+
+# Forward-pass parity: every logit of three prompts against the NumPy reference.
+# Slow on purpose (the reference is float64 NumPy), so it is not part of `make check`.
+check-forward: $(BIN)
+	@$(PYTHON) -c "import numpy" 2>/dev/null || { echo "make check-forward needs numpy"; exit 1; }
+	$(PYTHON) tools/check_forward.py --exe ./$(BIN) --model models/qwen2.5-0.5b-instruct-q8_0.gguf
+
+# Three-way parity: zeninfer vs NumPy (float64) vs HuggingFace transformers.
+# The HF checkpoint is built once from the gguf (~2.4 GiB of f32 weights).
+HF_DIR := $(BUILD)/hf_f32
+check-hf: $(BIN)
+	@$(PYTHON) -c "import numpy, torch, transformers, safetensors" 2>/dev/null || \
+		{ echo "make check-hf needs numpy + torch (CPU) + transformers + safetensors"; \
+		  echo "  pip install transformers safetensors -i https://pypi.tuna.tsinghua.edu.cn/simple"; \
+		  echo "  pip install torch --index-url https://download.pytorch.org/whl/cpu"; exit 1; }
+	@test -f $(HF_DIR)/model.safetensors || \
+		$(PYTHON) tools/gguf_to_hf.py models/qwen2.5-0.5b-instruct-q8_0.gguf $(HF_DIR)
+	$(PYTHON) tools/check_forward.py --exe ./$(BIN) --model models/qwen2.5-0.5b-instruct-q8_0.gguf --hf $(HF_DIR)
 
 # Cross-checks the two halves of the front end against independent
 # implementations. Requires: pip install tokenizers

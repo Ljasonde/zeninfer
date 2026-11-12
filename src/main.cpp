@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include "gguf.h"
+#include "model.h"
 #include "tokenizer.h"
 #include "unicode.h"
 
@@ -26,6 +28,8 @@ void print_usage() {
         "  zeninfer spans      <model.gguf> [--text S | --text-file F]   show pre-token spans\n"
         "  zeninfer vocab-dump <model.gguf> <out.vocab>  vocabulary as a flat, diffable file\n"
         "  zeninfer bench-tokenizer <model.gguf> <text-file> [--repeat N]   tokenizer throughput\n"
+        "  zeninfer logits     <model.gguf> [--text S | --text-file F | --ids 1,2,3]\n"
+        "                                  [--out F.bin] [--all] [--topk N]   forward pass, dump logits\n"
         "  zeninfer --vocab <file.vocab>               use a vocab-dump instead of a model\n"
         "  zeninfer run        <model.gguf> [opts]     generate text\n"
         "  zeninfer bench      <model.gguf> [opts]     measure prefill/decode throughput\n");
@@ -391,6 +395,121 @@ int cmd_bench_tokenizer(const std::string& model, const std::string& file, int r
     return 0;
 }
 
+int cmd_logits(const std::string& model_path, const std::string& text, const std::string& text_file,
+               const std::string& ids_arg, const std::string& out, int topk, bool all, int greedy = 0,
+               const std::string& text_out_path = "") {
+    zen::GGUFFile g(model_path);
+    zen::Tokenizer tok;
+    tok.load_from_gguf(g);
+
+    std::vector<int32_t> ids;
+    if (!ids_arg.empty()) {
+        size_t i = 0;
+        while (i < ids_arg.size()) {
+            size_t j = ids_arg.find(',', i);
+            if (j == std::string::npos) j = ids_arg.size();
+            const std::string piece = ids_arg.substr(i, j - i);
+            if (!piece.empty()) ids.push_back(static_cast<int32_t>(std::strtol(piece.c_str(), nullptr, 10)));
+            i = j + 1;
+        }
+    } else {
+        const std::string src = text_file.empty() ? text : read_file(text_file);
+        if (src.empty()) throw std::runtime_error("no input: pass --text, --text-file or --ids");
+        ids = tok.encode(src, true);
+    }
+    if (ids.empty()) throw std::runtime_error("empty token sequence");
+
+    const auto t_begin = std::chrono::steady_clock::now();
+    zen::Model model(g);
+    const auto t_loaded = std::chrono::steady_clock::now();
+
+    std::vector<float> logits = all ? model.forward_all(ids) : model.forward(ids);
+    const auto t_done = std::chrono::steady_clock::now();
+
+    const auto& cfg = model.cfg();
+    const size_t n_vocab = static_cast<size_t>(cfg.n_vocab);
+    const double load_ms = std::chrono::duration<double, std::milli>(t_loaded - t_begin).count();
+    const double run_ms = std::chrono::duration<double, std::milli>(t_done - t_loaded).count();
+
+    const float* last = logits.data() + (logits.size() - n_vocab);
+    double sum = 0.0, max_l = -1e30, min_l = 1e30;
+    for (size_t i = 0; i < n_vocab; ++i) {
+        max_l = std::max<double>(max_l, last[i]);
+        min_l = std::min<double>(min_l, last[i]);
+    }
+    for (size_t i = 0; i < n_vocab; ++i) sum += std::exp(static_cast<double>(last[i]) - max_l);
+
+    std::vector<uint32_t> order(n_vocab);
+    for (size_t i = 0; i < n_vocab; ++i) order[i] = static_cast<uint32_t>(i);
+    const int k = std::max(1, std::min<int>(topk, static_cast<int>(n_vocab)));
+    std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                      [&](uint32_t a, uint32_t b) { return last[a] > last[b]; });
+
+    std::printf("model            : %s\n", model_path.c_str());
+    std::printf("arch             : %s (%d layers, %d embd, %d heads / %d kv)\n", model.arch().c_str(),
+                cfg.n_layer, cfg.n_embd, cfg.n_head, cfg.n_head_kv);
+    std::printf("weights          : %.2f MiB on disk -> %.2f MiB f32\n",
+                model.source_bytes() / 1048576.0, model.resident_bytes() / 1048576.0);
+    std::printf("load             : %.1f ms\n", load_ms);
+    std::printf("tokens           : %zu\n", ids.size());
+    std::printf("forward          : %.1f ms (%.2f ms/token)\n", run_ms, run_ms / static_cast<double>(ids.size()));
+    std::printf("logits           : min %.4f  max %.4f  argmax %u\n", min_l, max_l, order[0]);
+    std::printf("softmax Z        : %.6f (sum of exp(logit - max))\n", sum);
+    std::printf("top-%d\n", k);
+    for (int i = 0; i < k; ++i) {
+        const uint32_t id = order[static_cast<size_t>(i)];
+        const double p = std::exp(static_cast<double>(last[id]) - max_l) / sum;
+        std::printf("  %2d. id %6u  logit %8.4f  p %.6f  %s\n", i + 1, id, last[id], p,
+                    tok.token_repr(id).c_str());
+    }
+
+    if (!out.empty()) {
+        std::ofstream f(out, std::ios::binary);
+        if (!f) throw std::runtime_error("cannot write " + out);
+        f.write(reinterpret_cast<const char*>(logits.data()),
+                static_cast<std::streamsize>(logits.size() * sizeof(float)));
+        std::fprintf(stderr, "wrote %s (%.2f MiB, %zu floats)\n", out.c_str(),
+                     logits.size() * sizeof(float) / 1048576.0, logits.size());
+    }
+
+    // Greedy sanity check. Deliberately re-runs the full prefill every step: M2 is
+    // about proving the math, and an O(n^2) loop is the version with the fewest ways
+    // to be wrong. The KV-cache version replaces this in M3.
+    if (greedy > 0) {
+        const int32_t eos = static_cast<int32_t>(g.get_u32("tokenizer.ggml.eos_token_id", 151645));
+        std::printf("\ngreedy (%d max, eos %d, full recompute per step)\n", greedy, eos);
+        std::vector<float> lg = logits;
+        std::vector<int32_t> cur = ids;
+        std::string text_out;
+        int produced = 0;
+        const auto t_gen = std::chrono::steady_clock::now();
+        for (int step = 0; step < greedy; ++step) {
+            const float* row = lg.data() + (lg.size() - n_vocab);
+            int32_t best = 0;
+            for (size_t i = 1; i < n_vocab; ++i) {
+                if (row[i] > row[best]) best = static_cast<int32_t>(i);
+            }
+            if (best == eos) break;
+            const std::string piece = tok.decode({best});
+            text_out += piece;
+            ++produced;
+            cur.push_back(best);
+            lg = model.forward(cur);
+        }
+        const double gen_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_gen).count();
+        std::printf("generated        : %d tokens in %.1f ms (%.1f ms/token, no cache)\n", produced, gen_ms,
+                    produced ? gen_ms / produced : 0.0);
+        std::printf("text             : %s\n", text_out.c_str());
+        if (!text_out_path.empty()) {
+            std::ofstream tf(text_out_path, std::ios::binary);
+            if (!tf) throw std::runtime_error("cannot write " + text_out_path);
+            tf.write(text_out.data(), static_cast<std::streamsize>(text_out.size()));
+            std::fprintf(stderr, "wrote %s (%zu bytes utf-8)\n", text_out_path.c_str(), text_out.size());
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -439,6 +558,31 @@ int main(int argc, char** argv) {
                 if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) repeat = std::atoi(argv[++i]);
             }
             return cmd_bench_tokenizer(argv[2], argv[3], repeat > 0 ? repeat : 1);
+        }
+        if (cmd == "logits") {
+            std::string model_path, text, text_file, ids_arg, out, text_out;
+            int topk = 8;
+            int greedy = 0;
+            bool all = false;
+            for (int i = 2; i < argc; ++i) {
+                const std::string a = argv[i];
+                auto value = [&]() -> std::string {
+                    if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
+                    return argv[++i];
+                };
+                if (a == "--text") text = value();
+                else if (a == "--text-file") text_file = value();
+                else if (a == "--ids") ids_arg = value();
+                else if (a == "--out") out = value();
+                else if (a == "--topk") topk = std::atoi(value().c_str());
+                else if (a == "--greedy") greedy = std::atoi(value().c_str());
+                else if (a == "--text-out") text_out = value();
+                else if (a == "--all") all = true;
+                else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown flag " + a);
+                else model_path = a;
+            }
+            if (model_path.empty()) throw std::runtime_error("missing model path");
+            return cmd_logits(model_path, text, text_file, ids_arg, out, topk, all, greedy, text_out);
         }
         if (cmd == "-h" || cmd == "--help" || cmd == "help") { print_usage(); return 0; }
         std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());
