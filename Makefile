@@ -50,6 +50,10 @@ test: $(BIN)
 # Cross-checks the two halves of the front end against independent
 # implementations. Requires: pip install tokenizers
 check: $(BIN)
+	@$(PYTHON) -c "import tokenizers" 2>/dev/null || \
+		{ echo "make check needs the HuggingFace tokenizers package:"; \
+		  echo "  pip install tokenizers -i https://pypi.tuna.tsinghua.edu.cn/simple"; \
+		  echo "  make check PYTHON=/path/to/that/python"; exit 1; }
 	@mkdir -p $(BUILD)
 	./$(BIN) vocab-dump models/qwen2.5-0.5b-instruct-q8_0.gguf $(BUILD)/q8_0.vocab
 	$(PYTHON) tools/dump_gguf.py models/qwen2.5-0.5b-instruct-q8_0.gguf --json > $(BUILD)/py.json

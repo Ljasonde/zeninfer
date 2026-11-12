@@ -96,6 +96,28 @@ The reference pipeline normalizes to NFC before splitting; zeninfer, like llama.
 Input that is not already NFC-composed (e.g. `a` + U+0301) therefore tokenizes differently.
 This is deliberate and counted separately in `tools/check_tokenizer.py` rather than hidden.
 
+## Verifying it yourself
+
+```sh
+make
+make check PYTHON=/path/to/python   # needs: pip install tokenizers
+```
+
+`make check` runs the three comparisons below and exits non-zero on any mismatch. Nothing it
+reports is produced by the code under test.
+
+| Check | Compared against | Expected |
+| --- | --- | --- |
+| GGUF structure | `tools/dump_gguf.py`, an independent pure-Python reader | `291 tensors identical` |
+| vocabulary + merges | `tokenizer.json` from the HuggingFace repo | `151643/151643`, `151387/151387` |
+| `encode()` | HuggingFace `tokenizers`, 2000 fuzz + 75 hand-written cases | `1979/1979` |
+
+Three spot checks that need no Python at all:
+
+* **291 is not a magic number.** 24 layers × 12 tensors (`attn_norm`, `attn_{q,k,v,o}`, `ffn_{norm,gate,up,down}`, with Q/K/V also having a bias) + `token_embd` + `output_norm` + `output` = 291.
+* **File size arithmetic.** `tensor_data_offset (5947744) + sum of tensor bytes (669763072)` must equal the file size on disk exactly: `675710816` bytes.
+* **Round trip.** `zeninfer tokenize --text "…" --pieces` prints `round trip : exact`, i.e. `decode(encode(x)) == x`, for every input it accepts.
+
 ## Repository layout
 
 ```
