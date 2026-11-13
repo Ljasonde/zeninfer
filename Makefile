@@ -1,7 +1,14 @@
 # zeninfer - CPU LLM inference engine
 #
-#   make                              build build/zeninfer (native arch)
-#   make ARCH="-march=x86-64-v3"      portable AVX2/FMA build (used by CI)
+#   make                    build build/zeninfer (native arch)
+#   make ARCH="-march=x86-64-v3"   portable AVX2/FMA build
+#   make help               list every target
+#   make bench              scalar/AVX2/thread ablation table
+#   make check              structure + tokenizer parity     (needs: tokenizers)
+#   make check-forward      all logits vs float64 NumPy      (needs: numpy)
+#   make check-hf           ... and vs HuggingFace           (needs: torch, transformers)
+#   make check-kv           KV cache is bit-exact            (needs: numpy)
+#   make check-generate     32 greedy tokens == HuggingFace  (needs: torch, transformers)
 #   make clean
 #
 # Requires only a C++17 compiler and make -- no cmake, no external libraries.
@@ -27,12 +34,16 @@ SRCS := $(wildcard $(SRC_DIR)/*.cpp)
 OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD)/%.o,$(SRCS))
 DEPS := $(OBJS:.o=.d)
 
-.PHONY: all clean test check check-forward check-hf check-kv check-generate
+.PHONY: all clean test help bench check check-forward check-hf check-kv check-generate
 
 PYTHON ?= python
 MODEL  ?= models/qwen2.5-0.5b-instruct-q8_0.gguf
+PROMPT ?= examples/prompt.txt
 
 all: $(BIN)
+
+help:
+	@sed -n '2,/^$$/p' Makefile | sed 's/^# \{0,1\}//'
 
 $(BIN): $(OBJS)
 	@mkdir -p $(BUILD)
@@ -47,6 +58,11 @@ clean:
 
 test: $(BIN)
 	./$(BIN) inspect $(MODEL)
+
+# The table in README.md is printed by this command, not typed in by hand.
+bench: $(BIN)
+	$(PYTHON) tools/ablation.py --exe ./$(BIN) --model $(MODEL) \
+		--text-file $(PROMPT) --max-new 16
 
 # Forward-pass parity: every logit of three prompts against the NumPy reference.
 # Slow on purpose (the reference is float64 NumPy), so it is not part of `make check`.

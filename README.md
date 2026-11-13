@@ -1,329 +1,172 @@
 # zeninfer
 
-A CPU-only LLM inference engine for [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct),
-written from scratch in C++17 with no BLAS, no ggml, and no ML framework.
+A CPU-only LLM inference engine for
+[Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct), written from scratch in
+C++17 — no BLAS, no ggml, no ML framework, no dependencies beyond a compiler.
 
-The goal is not to beat `llama.cpp`. The goal is to be able to explain, line by line, where its
-speed comes from — and to measure the gap instead of guessing it.
+The point is not to beat `llama.cpp`. It is to explain, line by line, where its speed comes from —
+and to *measure* the gap instead of guessing at it.
 
-```
-$ zeninfer bench-tokenizer models/qwen2.5-0.5b-instruct-q8_0.gguf corpus.txt
-input            : corpus.txt (0.58 MiB)
-tokens           : 130473 (4.674 bytes/token)
-best             : 73.68 ms = 7.9 MB/s = 1770878 tok/s
-```
+## Numbers
 
-## Status
+Measured on a Ryzen 7 8845H (8C/16T, DDR5-5600), q8_0 weights, `examples/prompt.txt`, 16 new tokens:
 
-| Milestone | What | State |
-| --- | --- | --- |
-| M1 | GGUF parser (mmap) + Qwen BPE tokenizer | **done** |
-| M2 | Forward pass: RMSNorm / RoPE / GQA / SwiGLU, checked against numpy | **done** |
-| M3 | KV cache + incremental decode + sampling | **done** |
-| M4 | AVX2 matvec + multithreading (batch=1: a GEMM would be a matvec) | **done** |
-| M5 | Q8_0 / Q4_0 quantization, perplexity cost | |
-| M6 | Benchmark harness + ablation table + OpenAI-compatible server | |
-
-## Build
-
-```sh
-make                      # -> build/zeninfer (g++/clang++, -march=native)
-make ARCH="-march=x86-64-v3"   # portable binary
-```
-
-Requirements: a C++17 compiler. No dependencies, no submodules, no CMake.
-
-## Usage
-
-```sh
-zeninfer inspect    <model.gguf> [--json]        # metadata, hyper-parameters, tensor table
-zeninfer tokenize   <model.gguf> --text "hello"  # ids, pieces, round-trip check
-zeninfer spans      <model.gguf> --text "hi  there"   # pre-tokenizer spans
-zeninfer vocab-dump <model.gguf> <out.vocab>     # flat, diffable vocabulary
-zeninfer bench-tokenizer <model.gguf> <file> [--repeat N]
-zeninfer logits     <model.gguf> --text-file prompt.txt [--topk 8] [--out logits.bin] [--greedy N]
-zeninfer generate   <model.gguf> --text-file prompt.txt --max-new 128 [--temp 0.7] [--top-k 40] [--top-p 0.9] [--no-cache]
-```
-
-Both `logits` and `generate` accept `--threads N` and `--impl scalar|avx2`; the environment
-variables `ZEN_THREADS` and `ZEN_IMPL` set the same defaults.
-
-`--json` on `inspect` emits a schema that `tools/dump_gguf.py --json` also produces, so the two
-independent implementations can be diffed tensor by tensor.
-
-> **Windows note.** PowerShell hands native arguments over in the OEM code page, so `--text "你好"`
-> arrives as mojibake bytes. The binary detects this and warns. Put the text in a UTF-8 file and use
-> `--text-file` instead.
-
-## M1: what is verified
-
-Both halves of the front end are checked against independent implementations rather than against
-themselves.
-
-**GGUF parser** — `tools/dump_gguf.py` is a standalone pure-Python GGUF reader (no gguf, no
-llama.cpp). Diffing its output against the C++ reader on `qwen2.5-0.5b-instruct-q8_0.gguf`:
-
-```
-OK: 291 tensors identical, 669763072 bytes, arch=qwen2
-    tokens=151936 merges=151387 alignment=32
-```
-
-That covers dtype, dims, byte size and file offset for every tensor, plus the alignment-derived
-`tensor_data_offset` and a payload out-of-bounds/overlap check.
-
-**Tokenizer** — 75 hand-written edge cases plus 2000 fuzz strings (CJK, emoji, combining marks,
-NBSP, ideographic space, U+2028, `<|im_start|>`, …) are compared against the HuggingFace
-`tokenizers` library:
-
-```
-1979/1979 cases match (100.00%)
-fuzz cases: 2000, hand-written: 75, skipped (need NFC): 43
-```
-
-And the vocabulary itself, token by token and merge by merge:
-
-```
-tokens: 151643/151643 identical, merges: 151387/151387 identical in rank order
-```
-
-### Two things that are easy to get wrong here
-
-*The merged vocabulary is byte-level, not raw bytes.* llama.cpp keeps GPT-2's byte-to-codepoint
-alphabet, so a space is stored as `Ġ` (U+0120) and a newline as `Ċ` (U+010A). A first version that
-treated the tokens as raw bytes found no token for `" "` at all. `ByteLevelTable` in
-`src/tokenizer.cpp` implements the forward and inverse mapping (68 bytes are remapped to U+0100+).
-
-*The pre-tokenizer regex cannot be handed to `std::regex`.* ECMAScript `\s` is not the same set as
-Python's, and `\s+(?!\S)` needs a lookahead that must agree with `\s*[\r\n]+` about which part of a
-whitespace run belongs to which alternative. `pretokenize()` is a hand-written scanner instead: for a
-run of whitespace it takes the position after the *last* newline, and falls back to giving back one
-character so the next span can start with a space.
-
-### Known limitation: no NFC
-
-The reference pipeline normalizes to NFC before splitting; zeninfer, like llama.cpp, does not.
-Input that is not already NFC-composed (e.g. `a` + U+0301) therefore tokenizes differently.
-This is deliberate and counted separately in `tools/check_tokenizer.py` rather than hidden.
-
-## Verifying it yourself
-
-```sh
-make
-make check PYTHON=/path/to/python   # needs: pip install tokenizers
-```
-
-`make check` runs the three comparisons below and exits non-zero on any mismatch. Nothing it
-reports is produced by the code under test.
-
-| Check | Compared against | Expected |
-| --- | --- | --- |
-| GGUF structure | `tools/dump_gguf.py`, an independent pure-Python reader | `291 tensors identical` |
-| vocabulary + merges | `tokenizer.json` from the HuggingFace repo | `151643/151643`, `151387/151387` |
-| `encode()` | HuggingFace `tokenizers`, 2000 fuzz + 75 hand-written cases | `1979/1979` |
-
-Three spot checks that need no Python at all:
-
-* **291 is not a magic number.** 24 layers × 12 tensors (`attn_norm`, `attn_{q,k,v,o}`, `ffn_{norm,gate,up,down}`, with Q/K/V also having a bias) + `token_embd` + `output_norm` + `output` = 291.
-* **File size arithmetic.** `tensor_data_offset (5947744) + sum of tensor bytes (669763072)` must equal the file size on disk exactly: `675710816` bytes.
-* **Round trip.** `zeninfer tokenize --text "…" --pieces` prints `round trip : exact`, i.e. `decode(encode(x)) == x`, for every input it accepts.
-
-## M2: what is verified
-
-The forward pass is checked against two implementations that were written independently of it:
-`tools/ref_forward.py` (NumPy, float64, separate gguf reader and separate dequantization) and
-HuggingFace `transformers`' own `Qwen2ForCausalLM` running the same weights converted to a
-checkpoint by `tools/gguf_to_hf.py`.
-
-```sh
-make check-forward PYTHON=/path/to/python                 # vs NumPy, tolerance 1e-4
-make check-hf PYTHON=/path/to/python                      # + vs HuggingFace (needs torch)
-```
-
-```
-case           tokens   max|diff|         argmax  result       vs hf  hf
-single-token        1   3.433e-05     271/271      PASS   1.304e-04  PASS
-chat-turn           9   8.106e-06    9707/9707      PASS   3.061e-05  PASS
-longer             26   4.292e-06    82707/82707    PASS   1.901e-05  PASS
-```
-
-The tight comparison is against the float64 NumPy reference; the HuggingFace column is looser
-because torch accumulates in float32, which is worth about 1e-4 on a logit of magnitude ~13 by
-itself. Both bounds are far below any real architecture error (a wrong RoPE convention or a
-mis-wired GQA head moves logits by whole units, not by 1e-4).
-
-What the tests do *not* share with the engine: gguf parsing, dequantization, tensor layout
-handling, RoPE convention, attention masking, GQA head mapping, or the order of the norms.
-
-A qualitative check that needs nothing but the binary:
-
-```
-$ zeninfer logits m.gguf --text-file hello.txt --greedy 10
-text : Hello! How can I assist you today?
-```
-
-and for `用一句话解释什么是 KV cache。` the first greedy token is `KV` (p=0.52). Beam-of-one
-coherence is a weak signal in general, but it rules out the failure mode where every tensor is
-slightly wrong and the model emits fluent-looking noise.
-
-### Baseline performance (before any optimization)
-
-Measured on the Ryzen 7 8845H, single thread, scalar code, weights pre-dequantized to f32:
-
-| Metric | Value |
+| | |
 | --- | --- |
-| load (dequantize 640 MiB → 2.4 GiB f32) | 1.23 s |
-| prefill | ~312 ms/token ≈ 3.2 tok/s |
-| decode (no cache: full re-prefill per token) | ~4.4 s/token at S≈9–18 |
+| decode | **20 tok/s** (48 ms/token, 4 threads) — **6.2×** the scalar baseline |
+| prefill | 34 ms/token (29 tok/s) |
+| tokenizer | **1.77M tok/s** — 130,473 tokens from 0.58 MiB of source in 73.7 ms |
+| logits vs float64 NumPy | max abs diff **5.0e-05** (bound 1e-4) |
+| KV cache vs full recompute | **bit-identical**: 3.2M logits, max diff exactly `0` |
+| source | 3.4k lines of C++, one 2.6 MB binary |
 
-This is the "before" column of the M4 ablation table: the current `matvec` is a plain double-accumulating
-loop over `float` rows, with no blocking, no AVX2 intrinsics and no thread pool.
-
-## M3: what is verified
-
-The KV cache is an optimisation, never a change of semantics. `make check-kv` states that two ways:
+## Quick start
 
 ```sh
-make check-kv PYTHON=/path/to/python       # needs numpy
+git clone https://github.com/Ljasonde/zeninfer && cd zeninfer
+mkdir -p models
+curl -L -o models/qwen2.5-0.5b-instruct-q8_0.gguf \
+  https://hf-mirror.com/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
+make
+./build/zeninfer generate models/qwen2.5-0.5b-instruct-q8_0.gguf --text-file examples/prompt.txt
 ```
 
 ```
-case           tokens    logits   max|diff|   result
-short               1    151936   0.000e+00   PASS
-sentence           13   1975168   0.000e+00   PASS
-chinese             7   1063552   0.000e+00   PASS
-
-greedy decisions, cached vs recomputed: ids match
+weights          : 638.74 MiB on disk -> 2403.90 MiB f32 (load 1466.8 ms)
+kv cache         : 87 pos x 24 layers x 128 kv-dim = 2.04 MiB
+prompt           : 15 tokens
+prefill          : 571.1 ms (38.08 ms/token, 26.26 tok/s)
+decode           : 28 tokens in 1403.8 ms (50.14 ms/token, 19.95 tok/s)
+stop             : eos
+text             : KV cache是一种用于存储键值对的缓存系统，通常使用键（key）和值（value）来存储数据。
 ```
 
-The comparison is `logits --all` (one full prefill) against `logits --all --cache` (the same
-positions evaluated one at a time through the cache). It is **bit-identical**, not merely close,
-because both paths accumulate in the same order — attention reads positions `[0, pos]` in the same
-sequence either way, so the cache removes redundant work without reordering a single addition.
+Requirements: a C++17 compiler and `make`. `make ARCH="-march=x86-64-v3"` builds a portable binary.
+Scope: this one model, batch size 1, CPU only.
 
-`make check-generate` asks a different question, using HuggingFace as the third opinion:
+### CLI
 
-```
-single-token   prompt=  1 tok  zen= 32  hf= 32  match=yes
-chat-turn      prompt= 15 tok  zen= 32  hf= 32  match=yes
-longer         prompt= 13 tok  zen= 32  hf= 32  match=yes
-RESULT: PASS (greedy argmax agrees token by token)
-```
-
-32 greedy tokens per prompt, identical one by one. A numerical difference that never moves an
-argmax is harmless; this test is what proves it stays harmless.
-
-### What the cache is worth
-
-Single thread, scalar code, `q8_0` weights dequantized to f32:
-
-| Context | With cache | Full recompute per token | Speedup |
-| --- | --- | --- | --- |
-| 6 → 14 tokens | ~306 ms/token | ~2902 ms/token | **9.5×** |
-| 26 → 42 tokens | ~310 ms/token | ~10736 ms/token | **34.6×** |
-
-Both columns are the same kernel doing the same math; the only difference is whether the keys and
-values of past positions are recomputed. That is why the speedup is a function of context length:
-without a cache every token costs O(n) and a generation of n tokens costs O(n²), while with a cache
-each step is a fixed cost of one token against n cached positions. The cached column is flat
-(~306–310 ms) exactly as predicted; the recompute column doubles when the context roughly doubles.
-
-The cost is memory: `n_layer × n_ctx × n_kv_heads × head_dim × 4 bytes × 2` — at the full 32k
-context that is 768 MiB, so `generate` allocates only what the sequence needs (94 positions ≈ 2.2 MiB).
-
-An end-to-end example that needs nothing but the binary — `用一句话解释什么是 KV cache。` as a chat
-turn (26 prompt tokens) decodes 17 tokens and stops at `<|im_end|>`:
-
-```
-KV cache是一种在计算机系统中用于存储键值对的缓存技术。
+```sh
+zeninfer inspect    <model.gguf> [--json]                 # metadata, hyper-parameters, tensors
+zeninfer tokenize   <model.gguf> --text-file prompt.txt   # ids, pieces, round-trip check
+zeninfer spans      <model.gguf> --text-file p.txt        # pre-tokenizer spans
+zeninfer vocab-dump <model.gguf> out.vocab                # flat, diffable vocabulary
+zeninfer logits     <model.gguf> --text-file p.txt [--topk 8] [--out logits.bin] [--greedy N]
+zeninfer generate   <model.gguf> --text-file p.txt --max-new 128 [--temp 0.7] [--top-k 40]
+zeninfer bench-tokenizer <model.gguf> <corpus.txt> [--repeat N]
 ```
 
-`--no-cache` produces the same prefix, one token at a time and about 35× slower, which is the
-point of the test above.
+`logits` and `generate` accept `--threads N` and `--impl scalar|avx2`; `ZEN_THREADS` and `ZEN_IMPL`
+set the same defaults.
 
-### Sampling
+> **Windows:** PowerShell passes native arguments in the OEM code page, so `--text "你好"` arrives as
+> mojibake. The binary warns when it detects that; use `--text-file` with UTF-8 text instead.
 
-`--temp 0` (the default) is greedy. Otherwise: repetition penalty over the last
-`--repeat-last-n` (64) tokens → temperature → top-k shortlist (256 when `--top-k` is unset) →
-top-p (nucleus) → inverse-CDF draw from a xorshift64* stream seeded by `--seed`, so a run is
-reproducible. Top-p is applied to that shortlist rather than the full 151936-way distribution;
-this is a documented approximation, not an accident.
+## Verify it yourself
 
-## M4: what is verified
+Every check compares against an implementation that shares no code with the engine. They exit
+non-zero on any mismatch.
 
-At batch size 1 every weight is touched exactly once per token, so the whole engine is one loop
-around a matrix-vector product. Two things change here: the dot product is vectorized with FMA, and
-the rows of the output matrix are spread over a thread pool.
+| Command | Proves | Needs |
+| --- | --- | --- |
+| `make check` | GGUF structure, vocabulary, and tokenizer parity | `pip install tokenizers` |
+| `make check-forward` | every logit of 3 prompts vs float64 NumPy (1e-4) | `numpy` |
+| `make check-hf` | the same vs HuggingFace `transformers` (5e-4) | `torch`, `transformers` |
+| `make check-kv` | cache == recompute, bit-exact; greedy ids unchanged | `numpy` |
+| `make check-generate` | 32 greedy tokens match HF, token by token | `torch`, `transformers` |
+| `make bench` | the ablation table below | — |
 
-**The fast path still computes the same model.** Against the scalar reference on the same prompt:
-`max |Δlogit| = 1.54e-05`, `mean 2.36e-06`, identical argmax (576). The end-to-end checks still pass
-with AVX2 as the default path:
+```
+$ make check PYTHON=/path/to/python
+OK: 291 tensors identical, 669763072 bytes, arch=qwen2
+tokens: 151643/151643 identical, merges: 151387/151387 identical in rank order
+1979/1979 cases match (100.00%)
+```
 
-| check | tolerance | single-token | chat-turn | longer |
-| --- | --- | ---: | ---: | ---: |
-| logits vs NumPy float64 | 1e-4 | 5.007e-05 | 1.454e-05 | 8.821e-06 |
-| logits vs HuggingFace | 5e-4 | 1.638e-04 | 2.825e-05 | 2.170e-05 |
-| KV cache bit-exactness | 0 | 0 | 0 | 0 |
+Full tables, plus the dead ends and the two format traps that cost the most time, are in the
+milestone reports: [M1](docs/M1-report.md) front end, [M2](docs/M2-report.md) forward pass,
+[M3](docs/M3-report.md) KV cache, [M4](docs/M4-report.md) kernels (Chinese; the tables and numbers
+are language-independent).
 
-The cache invariant survives the rewrite because both the cached and the recomputed paths run the
-same kernel in the same order — the test would catch it if that stopped being true.
+## How it works
 
-### Ablation (17-token prompt, 16 new tokens, Ryzen 7 8845H, DDR5-5600, `tools/ablation.py`)
+```
+bytes ──▶ BPE tokenizer ──▶ token embeddings
+                                │
+                    24 × transformer block
+                    ├─ RMSNorm ─▶ GQA attention (RoPE, KV cache)
+                    └─ RMSNorm ─▶ SwiGLU FFN
+                                │
+                         RMSNorm ─▶ lm_head ─▶ logits ──▶ sampler
+```
+
+- **Weights.** GGUF v2/v3 read through `mmap`, zero copy, rows dequantized once into f32. All 291
+  tensors are cross-checked against an independent pure-Python parser: dtype, dims, byte size,
+  offset, plus an out-of-bounds/overlap check on the payload.
+- **Tokenizer.** A hand-written pre-tokenizer scanner (the Qwen2 regex, which `std::regex` cannot
+  express) feeding a byte-level BPE. All 151,643 tokens and 151,387 merges are compared by value and
+  rank against `tokenizer.json`.
+- **Forward.** RMSNorm, NEOX RoPE, causal grouped-query attention (14 query / 2 KV heads), SwiGLU
+  and the residual chain, all written out, with double accumulation inside each dot product.
+- **KV cache.** Append-only, and bit-identical to a full recompute because both paths sum in the
+  same order — the test asserts `0.0`, not "close".
+- **Kernels.** AVX2+FMA dot product with four accumulators, plus a thread pool over output rows.
+  At batch 1 the engine is one matrix-vector product per token, so it is bandwidth bound: a token
+  streams 2.35 GiB of f32 weights, which at 48 ms is ~49 GiB/s — within 20% of what this laptop's
+  DDR5 delivers. That is why 2, 4 and 8 threads land within 5% of each other and 16 threads lose,
+  and why quantization, not vectorization, is the next lever.
+
+## Layout
+
+```
+src/gguf.{h,cpp}         GGUF v2/v3 reader, mmap, metadata, dequantization
+src/tokenizer.{h,cpp}    byte-level BPE + Qwen2 pre-tokenizer
+src/unicode.{h,cpp}      UTF-8 encode/decode, Unicode 15.0.0 class tables
+src/model.{h,cpp}        weights, forward pass, KV cache
+src/kernels.{h,cpp}      AVX2+FMA dot product, thread pool, scalar fallback
+src/sample.{h,cpp}       repetition penalty, temperature, top-k, top-p
+src/main.cpp             CLI
+
+tools/dump_gguf.py, ref_forward.py   independent reader and float64 forward pass (ground truth)
+tools/check_*.py                     the parity harnesses behind `make check*`
+tools/gguf_to_hf.py, hf_*.py         GGUF -> HuggingFace checkpoint; HF-side logits/generate
+tools/ablation.py                    prints the table under Performance
+tools/gen_unicode_tables.py          regenerates src/unicode_tables.h
+
+docs/M1..M4-report.md    what each milestone proves, in detail
+examples/prompt.txt      the prompt every number here was measured on
+```
+
+## Performance
+
+Ablation, 16 new tokens from `examples/prompt.txt` — the output of `make bench`:
 
 | config | prefill ms/token | decode ms/token | decode tok/s | vs scalar |
 | --- | ---: | ---: | ---: | ---: |
-| scalar, 1 thread | 240.4 | 315.2 | 3.17 | 1.00× |
-| avx2, 1 thread | 40.9 | 55.4 | 18.06 | 5.69× |
-| avx2, 2 threads | 32.3 | 46.3 | 21.60 | 6.81× |
-| avx2, 4 threads | 28.8 | 42.4 | 23.58 | 7.43× |
-| avx2, 8 threads | 31.6 | 47.6 | 21.02 | 6.62× |
-| avx2, 16 threads | 47.4 | 65.7 | 15.22 | 4.80× |
+| scalar, 1 thread | 230.8 | 307.8 | 3.25 | 1.00× |
+| avx2, 1 thread | 43.7 | 58.9 | 16.99 | 5.23× |
+| avx2, 2 threads | 36.3 | 49.2 | 20.32 | 6.26× |
+| avx2, 4 threads | 34.3 | 50.1 | 19.98 | 6.15× |
+| avx2, 8 threads | 36.7 | 51.3 | 19.51 | 6.01× |
+| avx2, 16 threads | 50.1 | 65.0 | 15.37 | 4.73× |
 
-Reproduce with `python tools/ablation.py --exe ./build/zeninfer --model models/qwen2.5-0.5b-instruct-q8_0.gguf --text-file prompt.txt`.
+Run-to-run spread is a few percent; the shape is the result, not the third digit.
 
-### Why more threads stop helping
+## Known limitations
 
-Every decoded token streams **2403.90 MiB of f32 weights** — there is no reuse to exploit at batch 1.
-Four threads give `2.348 GiB / 0.0424 s ≈ 55 GiB/s ≈ 59 GB/s`, which is the practical ceiling of this
-laptop's dual-channel DDR5 (theoretical 89.6 GB/s). A single core already reaches 42 GiB/s on its
-own, so the second pair of threads only buys 1.3×, and 8 or 16 threads lose to hyperthread
-contention rather than gaining anything.
-
-That is the real result of this milestone: **the kernel stopped being compute bound and became
-bandwidth bound.** The lever is no longer FMA throughput but *bytes read per token* — which is
-precisely what quantization attacks. Reading the existing q8_0 file directly (0.625 GiB per token)
-at the same 59 GB/s puts the ceiling at ≈11 ms/token ≈ 88 tok/s, roughly 4× above where the f32
-engine can go no matter how well it is vectorized. That number is the target M5 has to approach.
-
-## Repository layout
-
-```
-src/gguf.{h,cpp}        GGUF v2/v3 reader, mmap, typed metadata access, dequantization
-src/tokenizer.{h,cpp}   byte-level BPE, Qwen2 pre-tokenizer, special tokens
-src/unicode.{h,cpp}     UTF-8 decode/encode, Unicode 15.0.0 class tables
-src/unicode_tables.h    generated by tools/gen_unicode_tables.py (do not edit)
-src/model.{h,cpp}       f32 weight loading + Qwen2 forward (RMSNorm/RoPE/GQA/SwiGLU) + KV cache
-src/kernels.{h,cpp}     AVX2+FMA dot product, thread pool, scalar reference path
-src/sample.{h,cpp}      sampling: repetition penalty, temperature, top-k, top-p, seeded RNG
-src/main.cpp            CLI
-tools/dump_gguf.py      independent GGUF reader (reference implementation)
-tools/ref_forward.py    independent NumPy forward pass (float64)
-tools/check_tokenizer.py  parity harness against HuggingFace tokenizers
-tools/check_vocab.py    vocabulary/merge diff against tokenizer.json
-tools/check_forward.py  logit parity across three prompts
-tools/check_logits.py   diff two raw f32 logit dumps
-tools/check_kv.py       cache invariants: bit-exact logits, unchanged greedy decisions
-tools/check_generate.py greedy ids vs transformers, token by token
-tools/hf_generate.py    transformers generate() on explicit ids
-tools/gguf_to_hf.py     gguf -> HuggingFace checkpoint (for ground truth)
-tools/hf_logits.py      logits straight out of transformers
-tools/ablation.py       scalar/AVX2/thread sweep, prints the table above
-tools/gen_unicode_tables.py
-```
+- f32 weights in RAM (2.4 GiB for this model); quantized matvec is M5, not done yet.
+- Batch size 1. No continuous batching, no paged attention, one request at a time.
+- No NFC normalization, like `llama.cpp` and unlike HuggingFace: non-composed input tokenizes
+  differently. Counted separately in `check_tokenizer.py` rather than hidden.
+- Top-p samples from a 256-token shortlist, not the full 151,936-way distribution. Documented, not
+  accidental.
+- AVX2 only; no AVX-512 or NEON path.
 
 ## Roadmap
 
-M5 quantization and its perplexity cost, M6 benchmark harness and an OpenAI-compatible endpoint.
-Numbers get published as they are measured; nothing here is an estimate dressed as a result.
+M5 — Q8_0/Q4_0 matvec that reads the quantized blocks directly, plus the perplexity cost of each
+format. M6 — benchmark harness and an OpenAI-compatible endpoint so `agentctl` can use this as its
+local backend. Numbers get published when measured; nothing here is an estimate dressed as a result.
 
 ## License
 

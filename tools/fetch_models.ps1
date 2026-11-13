@@ -1,16 +1,18 @@
+# Downloads the model files used by the checks into ./models.
+#   pwsh tools/fetch_models.ps1
+# hf-mirror.com is the reachable mirror in mainland China; swap in huggingface.co if you prefer.
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$root = 'D:\zeninfer'
+$root = Split-Path -Parent $PSScriptRoot
 $mdir = Join-Path $root 'models'
 New-Item -ItemType Directory -Force -Path $mdir | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $root 'tools') | Out-Null
 
 $base = 'https://hf-mirror.com'
 $files = @(
-  @{ url = "$base/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json";                 name = 'tokenizer.json' },
-  @{ url = "$base/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf"; name = 'qwen2.5-0.5b-instruct-q8_0.gguf' },
-  @{ url = "$base/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf"; name = 'qwen2.5-0.5b-instruct-q4_0.gguf' },
-  @{ url = "$base/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-fp16.gguf"; name = 'qwen2.5-0.5b-instruct-fp16.gguf' }
+  @{ url = "$base/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json";                          name = 'tokenizer.json' },
+  @{ url = "$base/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf";   name = 'qwen2.5-0.5b-instruct-q8_0.gguf' },
+  @{ url = "$base/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf";   name = 'qwen2.5-0.5b-instruct-q4_0.gguf' },
+  @{ url = "$base/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-fp16.gguf";   name = 'qwen2.5-0.5b-instruct-fp16.gguf' }
 )
 
 foreach ($f in $files) {
