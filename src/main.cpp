@@ -13,6 +13,7 @@
 
 #include "gguf.h"
 #include "model.h"
+#include "sample.h"
 #include "tokenizer.h"
 #include "unicode.h"
 
@@ -29,7 +30,12 @@ void print_usage() {
         "  zeninfer vocab-dump <model.gguf> <out.vocab>  vocabulary as a flat, diffable file\n"
         "  zeninfer bench-tokenizer <model.gguf> <text-file> [--repeat N]   tokenizer throughput\n"
         "  zeninfer logits     <model.gguf> [--text S | --text-file F | --ids 1,2,3]\n"
-        "                                  [--out F.bin] [--all] [--topk N]   forward pass, dump logits\n"
+        "                                  [--out F.bin] [--all] [--topk N] [--cache]\n"
+        "                                  forward pass, dump logits\n"
+        "  zeninfer generate   <model.gguf> [--text S | --text-file F | --ids 1,2,3]\n"
+        "                                  [--max-new N] [--temp T] [--top-k K] [--top-p P]\n"
+        "                                  [--repeat-penalty R] [--seed S] [--no-cache] [--json]\n"
+        "                                  KV-cached incremental decode + sampling\n"
         "  zeninfer --vocab <file.vocab>               use a vocab-dump instead of a model\n"
         "  zeninfer run        <model.gguf> [opts]     generate text\n"
         "  zeninfer bench      <model.gguf> [opts]     measure prefill/decode throughput\n");
@@ -344,6 +350,17 @@ int cmd_tokenize(const TokOpts& o) {
 
     std::vector<std::string> pieces;
     const std::vector<int32_t> ids = tok.encode(text, &pieces, true);
+    if (o.json) {
+        // Same shape as the --batch rows, so a caller can parse both the same way.
+        std::printf("{\"ids\":[");
+        for (size_t k = 0; k < ids.size(); ++k) std::printf("%s%d", k ? "," : "", ids[k]);
+        std::printf("],\"pieces\":[");
+        for (size_t k = 0; k < pieces.size(); ++k) {
+            std::printf("%s\"%s\"", k ? "," : "", json_escape(pieces[k]).c_str());
+        }
+        std::printf("],\"text\":\"%s\"}\n", json_escape(text).c_str());
+        return 0;
+    }
     print_tok_stats(tok);
     std::printf("\ntext             : \"%s\" (%zu bytes)\n", repr(text).c_str(), text.size());
     std::printf("tokens           : %zu\n", ids.size());
@@ -397,7 +414,7 @@ int cmd_bench_tokenizer(const std::string& model, const std::string& file, int r
 
 int cmd_logits(const std::string& model_path, const std::string& text, const std::string& text_file,
                const std::string& ids_arg, const std::string& out, int topk, bool all, int greedy = 0,
-               const std::string& text_out_path = "") {
+               const std::string& text_out_path = "", bool use_cache = false) {
     zen::GGUFFile g(model_path);
     zen::Tokenizer tok;
     tok.load_from_gguf(g);
@@ -423,7 +440,28 @@ int cmd_logits(const std::string& model_path, const std::string& text, const std
     zen::Model model(g);
     const auto t_loaded = std::chrono::steady_clock::now();
 
-    std::vector<float> logits = all ? model.forward_all(ids) : model.forward(ids);
+    std::vector<float> logits;
+    if (use_cache) {
+        // Same logits, produced one position at a time through the KV cache. This
+        // is what makes the two paths comparable row by row: `--all` without the
+        // flag is a single full recompute, with it the same rows come out of S
+        // single-token steps.
+        if (all) {
+            const size_t V = static_cast<size_t>(model.cfg().n_vocab);
+            model.reserve_cache(static_cast<int>(ids.size()) + 1);
+            logits.resize(ids.size() * V);
+            for (size_t t = 0; t < ids.size(); ++t) {
+                const std::vector<float>& row = model.eval({ids[t]});
+                std::memcpy(logits.data() + t * V, row.data(), V * sizeof(float));
+            }
+        } else {
+            model.reserve_cache(static_cast<int>(ids.size()) + 1);
+            const std::vector<float>& row = model.eval(ids);
+            logits.assign(row.begin(), row.end());
+        }
+    } else {
+        logits = all ? model.forward_all(ids) : model.forward(ids);
+    }
     const auto t_done = std::chrono::steady_clock::now();
 
     const auto& cfg = model.cfg();
@@ -510,6 +548,141 @@ int cmd_logits(const std::string& model_path, const std::string& text, const std
     return 0;
 }
 
+double ms_between(const std::chrono::steady_clock::time_point& a,
+                  const std::chrono::steady_clock::time_point& b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+std::vector<int32_t> parse_ids(const std::string& s) {
+    std::vector<int32_t> ids;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t j = s.find(',', i);
+        if (j == std::string::npos) j = s.size();
+        const std::string piece = s.substr(i, j - i);
+        if (!piece.empty()) ids.push_back(static_cast<int32_t>(std::strtol(piece.c_str(), nullptr, 10)));
+        i = j + 1;
+    }
+    return ids;
+}
+
+struct GenOpts {
+    std::string model, text, text_file, ids_arg, text_out;
+    int max_new = 64;
+    int top_k = 0;
+    int repeat_n = 64;
+    float temp = 0.0f, top_p = 1.0f, repeat_penalty = 1.0f;
+    uint64_t seed = 0;
+    bool no_cache = false, json = false;
+};
+
+int cmd_generate(const GenOpts& o) {
+    zen::GGUFFile g(o.model);
+    zen::Tokenizer tok;
+    tok.load_from_gguf(g);
+
+    std::vector<int32_t> prompt;
+    if (!o.ids_arg.empty()) {
+        prompt = parse_ids(o.ids_arg);
+    } else {
+        const std::string src = o.text_file.empty() ? o.text : read_file(o.text_file);
+        if (src.empty()) throw std::runtime_error("no input: pass --text, --text-file or --ids");
+        prompt = tok.encode(src, true);
+    }
+    if (prompt.empty()) throw std::runtime_error("empty token sequence");
+
+    const auto t_load0 = std::chrono::steady_clock::now();
+    zen::Model model(g);
+    const auto t_load1 = std::chrono::steady_clock::now();
+
+    const auto& cfg = model.cfg();
+    const int32_t eos = static_cast<int32_t>(g.get_u32("tokenizer.ggml.eos_token_id", 151645));
+    const int64_t want = static_cast<int64_t>(prompt.size()) + o.max_new + 8;
+    const int ctx = static_cast<int>(std::min<int64_t>(cfg.n_ctx, std::max<int64_t>(want, 32)));
+    if (!o.no_cache) model.reserve_cache(ctx);
+
+    std::vector<float> logits;
+    const auto t_pre0 = std::chrono::steady_clock::now();
+    if (o.no_cache) {
+        logits = model.forward(prompt);
+    } else {
+        const std::vector<float>& row = model.eval(prompt);
+        logits.assign(row.begin(), row.end());
+    }
+    const auto t_pre1 = std::chrono::steady_clock::now();
+
+    zen::Rng rng(o.seed);
+    zen::SamplingParams sp;
+    sp.temp = o.temp;
+    sp.top_k = o.top_k;
+    sp.top_p = o.top_p;
+    sp.repeat_penalty = o.repeat_penalty;
+    sp.repeat_last_n = o.repeat_n;
+
+    std::vector<int32_t> gen;
+    std::string out;
+    double decode_ms = 0.0;
+    std::string stop = "max-new";
+    for (int step = 0; step < o.max_new; ++step) {
+        const int32_t next = zen::sample_token(logits.data(), cfg.n_vocab, sp, gen, rng);
+        if (next == eos) {
+            stop = "eos";
+            break;
+        }
+        gen.push_back(next);
+        out += tok.decode({next});
+
+        const auto d0 = std::chrono::steady_clock::now();
+        if (o.no_cache) {
+            std::vector<int32_t> cur = prompt;
+            cur.insert(cur.end(), gen.begin(), gen.end());
+            logits = model.forward(cur);
+        } else {
+            const std::vector<float>& row = model.eval({next});
+            logits.assign(row.begin(), row.end());
+        }
+        const auto d1 = std::chrono::steady_clock::now();
+        decode_ms += ms_between(d0, d1);
+    }
+    const double prefill_ms = ms_between(t_pre0, t_pre1);
+    const double load_ms = ms_between(t_load0, t_load1);
+
+    if (o.json) {
+        std::printf("{\"prompt_tokens\":%zu,\"prefill_ms\":%.3f,\"decode_tokens\":%zu,"
+                    "\"decode_ms\":%.3f,\"stop\":\"%s\",\"ids\":[",
+                    prompt.size(), prefill_ms, gen.size(), decode_ms, stop.c_str());
+        for (size_t i = 0; i < gen.size(); ++i) std::printf("%s%d", i ? "," : "", gen[i]);
+        std::printf("],\"text\":\"%s\"}\n", json_escape(out).c_str());
+        return 0;
+    }
+
+    std::printf("model            : %s\n", o.model.c_str());
+    std::printf("weights          : %.2f MiB on disk -> %.2f MiB f32 (load %.1f ms)\n",
+                model.source_bytes() / 1048576.0, model.resident_bytes() / 1048576.0, load_ms);
+    if (o.no_cache) {
+        std::printf("kv cache         : disabled (full recompute per token)\n");
+    } else {
+        std::printf("kv cache         : %d pos x %d layers x %d kv-dim = %.2f MiB\n", ctx, cfg.n_layer,
+                    cfg.n_head_kv * cfg.head_dim, model.cache_bytes() / 1048576.0);
+    }
+    std::printf("prompt           : %zu tokens\n", prompt.size());
+    std::printf("prefill          : %.1f ms (%.2f ms/token, %.2f tok/s)\n", prefill_ms,
+                prefill_ms / static_cast<double>(prompt.size()),
+                1000.0 * static_cast<double>(prompt.size()) / prefill_ms);
+    std::printf("decode           : %zu tokens in %.1f ms (%.2f ms/token, %.2f tok/s)\n", gen.size(),
+                decode_ms, gen.empty() ? 0.0 : decode_ms / static_cast<double>(gen.size()),
+                decode_ms > 0.0 ? 1000.0 * static_cast<double>(gen.size()) / decode_ms : 0.0);
+    std::printf("stop             : %s\n", stop.c_str());
+    std::printf("text             : %s\n", out.c_str());
+    if (!o.text_out.empty()) {
+        std::ofstream tf(o.text_out, std::ios::binary);
+        if (!tf) throw std::runtime_error("cannot write " + o.text_out);
+        tf.write(out.data(), static_cast<std::streamsize>(out.size()));
+        std::fprintf(stderr, "wrote %s (%zu bytes utf-8)\n", o.text_out.c_str(), out.size());
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -563,7 +736,7 @@ int main(int argc, char** argv) {
             std::string model_path, text, text_file, ids_arg, out, text_out;
             int topk = 8;
             int greedy = 0;
-            bool all = false;
+            bool all = false, use_cache = false;
             for (int i = 2; i < argc; ++i) {
                 const std::string a = argv[i];
                 auto value = [&]() -> std::string {
@@ -578,11 +751,41 @@ int main(int argc, char** argv) {
                 else if (a == "--greedy") greedy = std::atoi(value().c_str());
                 else if (a == "--text-out") text_out = value();
                 else if (a == "--all") all = true;
+                else if (a == "--cache") use_cache = true;
                 else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown flag " + a);
                 else model_path = a;
             }
             if (model_path.empty()) throw std::runtime_error("missing model path");
-            return cmd_logits(model_path, text, text_file, ids_arg, out, topk, all, greedy, text_out);
+            return cmd_logits(model_path, text, text_file, ids_arg, out, topk, all, greedy, text_out,
+                              use_cache);
+        }
+        if (cmd == "generate") {
+            GenOpts o;
+            for (int i = 2; i < argc; ++i) {
+                const std::string a = argv[i];
+                auto value = [&]() -> std::string {
+                    if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
+                    return argv[++i];
+                };
+                if (a == "--text") o.text = value();
+                else if (a == "--text-file") o.text_file = value();
+                else if (a == "--ids") o.ids_arg = value();
+                else if (a == "--max-new") o.max_new = std::atoi(value().c_str());
+                else if (a == "--temp" || a == "--temperature") o.temp = static_cast<float>(std::atof(value().c_str()));
+                else if (a == "--top-k") o.top_k = std::atoi(value().c_str());
+                else if (a == "--top-p") o.top_p = static_cast<float>(std::atof(value().c_str()));
+                else if (a == "--repeat-penalty") o.repeat_penalty = static_cast<float>(std::atof(value().c_str()));
+                else if (a == "--repeat-last-n") o.repeat_n = std::atoi(value().c_str());
+                else if (a == "--seed") o.seed = std::strtoull(value().c_str(), nullptr, 10);
+                else if (a == "--text-out") o.text_out = value();
+                else if (a == "--no-cache") o.no_cache = true;
+                else if (a == "--json") o.json = true;
+                else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown flag " + a);
+                else o.model = a;
+            }
+            if (o.model.empty()) throw std::runtime_error("missing model path");
+            if (o.max_new < 0) throw std::runtime_error("--max-new must be >= 0");
+            return cmd_generate(o);
         }
         if (cmd == "-h" || cmd == "--help" || cmd == "help") { print_usage(); return 0; }
         std::fprintf(stderr, "unknown command '%s'\n", cmd.c_str());

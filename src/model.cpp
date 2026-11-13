@@ -141,6 +141,36 @@ void Model::load(const GGUFFile& f) {
     }
 }
 
+// ---------------------------------------------------------------- kv cache
+
+void KVCache::reset(int layers, int ctx, int dim) {
+    n_layer = layers;
+    n_ctx = ctx;
+    kv_dim = dim;
+    len = 0;
+    const size_t n = static_cast<size_t>(n_layer) * static_cast<size_t>(n_ctx) *
+                     static_cast<size_t>(kv_dim);
+    k.assign(n, 0.0f);
+    v.assign(n, 0.0f);
+}
+
+float* KVCache::k_at(int layer, int64_t pos) {
+    return k.data() + (static_cast<size_t>(layer) * static_cast<size_t>(n_ctx) +
+                       static_cast<size_t>(pos)) * static_cast<size_t>(kv_dim);
+}
+float* KVCache::v_at(int layer, int64_t pos) {
+    return v.data() + (static_cast<size_t>(layer) * static_cast<size_t>(n_ctx) +
+                       static_cast<size_t>(pos)) * static_cast<size_t>(kv_dim);
+}
+const float* KVCache::k_at(int layer, int64_t pos) const {
+    return k.data() + (static_cast<size_t>(layer) * static_cast<size_t>(n_ctx) +
+                       static_cast<size_t>(pos)) * static_cast<size_t>(kv_dim);
+}
+const float* KVCache::v_at(int layer, int64_t pos) const {
+    return v.data() + (static_cast<size_t>(layer) * static_cast<size_t>(n_ctx) +
+                       static_cast<size_t>(pos)) * static_cast<size_t>(kv_dim);
+}
+
 // ---------------------------------------------------------------- forward
 
 std::vector<float> Model::forward(const std::vector<int32_t>& tokens) {
@@ -256,6 +286,126 @@ std::vector<float> Model::forward_all(const std::vector<int32_t>& tokens) {
         std::memcpy(logits.data() + t * V, row.data(), static_cast<size_t>(V) * sizeof(float));
     }
     return logits;
+}
+
+// ---------------------------------------------------------------- incremental
+
+void Model::reserve_cache(int n_ctx) {
+    if (n_ctx <= 0) fail("model: n_ctx must be positive");
+    cache_.reset(cfg_.n_layer, n_ctx, cfg_.n_head_kv * cfg_.head_dim);
+}
+
+const std::vector<float>& Model::eval(const std::vector<int32_t>& tokens) {
+    const int64_t S = static_cast<int64_t>(tokens.size());
+    if (S <= 0) fail("model: empty token chunk");
+    if (cache_.n_ctx <= 0) fail("model: call reserve_cache() before eval()");
+    const int64_t P0 = cache_.len;
+    if (P0 + S > cache_.n_ctx) fail("model: kv cache full (" + std::to_string(P0) + " + " +
+                                    std::to_string(S) + " > " + std::to_string(cache_.n_ctx) + ")");
+
+    const int64_t E = cfg_.n_embd, H = cfg_.n_head, KVH = cfg_.n_head_kv, D = cfg_.head_dim;
+    const int64_t FF = cfg_.n_ff, V = cfg_.n_vocab, G = cfg_.n_group();
+    const int64_t kv_dim = KVH * D;
+    for (int32_t t : tokens) {
+        if (t < 0 || t >= V) fail("model: token id out of range");
+    }
+
+    std::vector<float> x(static_cast<size_t>(S * E));
+    for (int64_t t = 0; t < S; ++t) {
+        const float* src = token_embd_.row(tokens[static_cast<size_t>(t)]);
+        std::memcpy(x.data() + t * E, src, static_cast<size_t>(E) * sizeof(float));
+    }
+
+    std::vector<float> xn(static_cast<size_t>(E));
+    std::vector<float> q(static_cast<size_t>(S * E));
+    std::vector<float> kt(static_cast<size_t>(kv_dim)), vt(static_cast<size_t>(kv_dim));
+    std::vector<float> attn(static_cast<size_t>(S * E));
+    std::vector<float> proj(static_cast<size_t>(E));
+    std::vector<float> gate(static_cast<size_t>(FF)), up(static_cast<size_t>(FF));
+    std::vector<double> scores(static_cast<size_t>(P0 + S));
+
+    for (int li = 0; li < cfg_.n_layer; ++li) {
+        const Layer& l = layers_[static_cast<size_t>(li)];
+
+        // ---- project this chunk of positions and append K/V to the cache
+        for (int64_t t = 0; t < S; ++t) {
+            const int64_t pos = P0 + t;
+            rmsnorm(xn.data(), x.data() + t * E, l.attn_norm.data(), E, cfg_.rms_eps);
+            float* qt = q.data() + t * E;
+            matvec(qt, xn.data(), l.wq);
+            matvec(kt.data(), xn.data(), l.wk);
+            matvec(vt.data(), xn.data(), l.wv);
+            for (int64_t i = 0; i < E; ++i) qt[i] += l.bq.data()[i];
+            for (int64_t i = 0; i < kv_dim; ++i) {
+                kt[static_cast<size_t>(i)] += l.bk.data()[i];
+                vt[static_cast<size_t>(i)] += l.bv.data()[i];
+            }
+            rope_neox(qt, H, D, pos, cfg_.rope_base);
+            rope_neox(kt.data(), KVH, D, pos, cfg_.rope_base);
+            std::memcpy(cache_.k_at(li, pos), kt.data(), static_cast<size_t>(kv_dim) * sizeof(float));
+            std::memcpy(cache_.v_at(li, pos), vt.data(), static_cast<size_t>(kv_dim) * sizeof(float));
+        }
+
+        // ---- attention: query at pos attends to every cached key <= pos
+        const double scale = 1.0 / std::sqrt(static_cast<double>(D));
+        std::fill(attn.begin(), attn.end(), 0.0f);
+        for (int64_t h = 0; h < H; ++h) {
+            const int64_t kvh = h / G;
+            for (int64_t t = 0; t < S; ++t) {
+                const int64_t pos = P0 + t;
+                const int64_t n = pos + 1;
+                const float* qh = q.data() + t * E + h * D;
+                double max_score = -1e30;
+                for (int64_t s = 0; s < n; ++s) {
+                    const float* kh = cache_.k_at(li, s) + kvh * D;
+                    double acc = 0.0;
+                    for (int64_t d = 0; d < D; ++d) acc += static_cast<double>(qh[d]) * kh[d];
+                    acc *= scale;
+                    scores[static_cast<size_t>(s)] = acc;
+                    if (acc > max_score) max_score = acc;
+                }
+                double sum = 0.0;
+                for (int64_t s = 0; s < n; ++s) {
+                    const double e = std::exp(scores[static_cast<size_t>(s)] - max_score);
+                    scores[static_cast<size_t>(s)] = e;
+                    sum += e;
+                }
+                const double inv = 1.0 / sum;
+                float* out = attn.data() + t * E + h * D;
+                for (int64_t s = 0; s < n; ++s) {
+                    const double p = scores[static_cast<size_t>(s)] * inv;
+                    const float* vh = cache_.v_at(li, s) + kvh * D;
+                    for (int64_t d = 0; d < D; ++d) {
+                        out[d] = static_cast<float>(static_cast<double>(out[d]) + p * vh[d]);
+                    }
+                }
+            }
+        }
+
+        for (int64_t t = 0; t < S; ++t) {
+            float* xt = x.data() + t * E;
+            matvec(proj.data(), attn.data() + t * E, l.wo);
+            for (int64_t i = 0; i < E; ++i) xt[i] = static_cast<float>(xt[i] + proj[static_cast<size_t>(i)]);
+        }
+
+        // ---- SwiGLU block
+        for (int64_t t = 0; t < S; ++t) {
+            float* xt = x.data() + t * E;
+            rmsnorm(xn.data(), xt, l.ffn_norm.data(), E, cfg_.rms_eps);
+            matvec(gate.data(), xn.data(), l.w_gate);
+            matvec(up.data(), xn.data(), l.w_up);
+            silu_inplace(gate.data(), FF);
+            for (int64_t i = 0; i < FF; ++i) gate[static_cast<size_t>(i)] *= up[static_cast<size_t>(i)];
+            matvec(proj.data(), gate.data(), l.w_down);
+            for (int64_t i = 0; i < E; ++i) xt[i] = static_cast<float>(xt[i] + proj[static_cast<size_t>(i)]);
+        }
+    }
+
+    rmsnorm(xn.data(), x.data() + (S - 1) * E, output_norm_.data(), E, cfg_.rms_eps);
+    logits_.resize(static_cast<size_t>(V));
+    matvec(logits_.data(), xn.data(), output_);
+    cache_.len = P0 + S;
+    return logits_;
 }
 
 }  // namespace zen

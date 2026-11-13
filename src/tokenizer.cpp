@@ -257,20 +257,40 @@ std::string Tokenizer::token_repr(int32_t id) const {
     const std::string s = byte_level_decode(token(id));
     std::string out;
     out.reserve(s.size() + 2);
-    for (unsigned char b : s) {
-        switch (b) {
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            case '\\': out += "\\\\"; break;
-            default:
-                if (b < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof buf, "\\x%02x", b);
-                    out += buf;
-                } else {
-                    out.push_back(static_cast<char>(b));
-                }
+    const size_t n = s.size();
+    for (size_t i = 0; i < n;) {
+        const unsigned char b = static_cast<unsigned char>(s[i]);
+        if (b < 0x80) {
+            switch (b) {
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                case '\\': out += "\\\\"; break;
+                default:
+                    if (b < 0x20) {
+                        char buf[8];
+                        std::snprintf(buf, sizeof buf, "\\x%02x", b);
+                        out += buf;
+                    } else {
+                        out.push_back(static_cast<char>(b));
+                    }
+            }
+            ++i;
+            continue;
+        }
+        // A byte-level vocabulary can split one character across several tokens, so a
+        // single token may hold an incomplete UTF-8 sequence. Escape anything that does
+        // not decode cleanly: CLI output has to stay valid UTF-8 for scripts to read.
+        uint32_t cp = 0;
+        const size_t adv = zen::utf8_decode(s.data(), n, i, &cp);
+        if (adv > 1 && cp != 0xFFFD) {
+            out.append(s, i, adv);
+            i += adv;
+        } else {
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "\\x%02x", b);
+            out += buf;
+            ++i;
         }
     }
     return out;

@@ -11,6 +11,7 @@ usage:
     python tools/check_forward.py --exe build/zeninfer --model models/x.gguf [--tol 1e-4]
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -39,11 +40,7 @@ def run(cmd, **kw):
 
 def ids_for(exe, model, text_file):
     out = run([exe, "tokenize", model, "--text-file", text_file, "--json"])
-    for line in out.splitlines():
-        if line.startswith("ids"):
-            body = line.split("[", 1)[1].rstrip("] ")
-            return [int(x) for x in body.split(",") if x.strip()]
-    raise SystemExit("could not parse ids from tokenize output:\n" + out)
+    return json.loads(out.strip().splitlines()[-1])["ids"]
 
 
 def main():

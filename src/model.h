@@ -51,6 +51,28 @@ struct Config {
     int n_group() const { return n_head / n_head_kv; }  // query heads per kv head
 };
 
+// Key/value cache: one contiguous buffer per side, indexed [layer][pos][kv_dim].
+// Positions are written once and never rewritten, so a slot for position p holds
+// exactly the K/V that a full recompute of the sequence would produce at p.
+struct KVCache {
+    int n_layer = 0;
+    int n_ctx = 0;
+    int kv_dim = 0;
+    int64_t len = 0;  // positions written so far
+    std::vector<float> k;
+    std::vector<float> v;
+
+    void reset(int layers, int ctx, int dim);
+    void clear() { len = 0; }
+    float* k_at(int layer, int64_t pos);
+    float* v_at(int layer, int64_t pos);
+    const float* k_at(int layer, int64_t pos) const;
+    const float* v_at(int layer, int64_t pos) const;
+    uint64_t bytes() const {
+        return (k.size() + v.size()) * sizeof(float);
+    }
+};
+
 class Model {
   public:
     // Reads and dequantizes every weight into f32. `quantized` is reported for
@@ -63,11 +85,22 @@ class Model {
     uint64_t resident_bytes() const { return resident_bytes_; }
     uint64_t source_bytes() const { return source_bytes_; }
 
-    // Full-sequence prefill (no KV cache yet): returns logits of the LAST token,
-    // n_vocab floats.
+    // Reference path, no cache: returns logits of the LAST token, n_vocab floats.
+    // Kept because an O(n^2) full recompute is the version with the fewest ways
+    // to be wrong, which makes it the right oracle for the cached path.
     std::vector<float> forward(const std::vector<int32_t>& tokens);
     // Logits for every position, row-major [n_tokens][n_vocab].
     std::vector<float> forward_all(const std::vector<int32_t>& tokens);
+
+    // ---- incremental path (M3) -------------------------------------------
+    // Allocates the cache. Must be called before eval().
+    void reserve_cache(int n_ctx);
+    void reset_cache() { cache_.clear(); }
+    int64_t cache_len() const { return cache_.len; }
+    uint64_t cache_bytes() const { return cache_.bytes(); }
+    // Appends `tokens` at cache_len and returns the logits of the last one.
+    // The returned reference is valid until the next call.
+    const std::vector<float>& eval(const std::vector<int32_t>& tokens);
 
   private:
     void load(const GGUFFile& f);
@@ -80,6 +113,8 @@ class Model {
     Mat output_;      // [n_vocab][n_embd]
     Vec output_norm_;
     std::vector<Layer> layers_;
+    KVCache cache_;
+    std::vector<float> logits_;
     uint64_t resident_bytes_ = 0;
     uint64_t source_bytes_ = 0;
 };
