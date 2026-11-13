@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "gguf.h"
+#include "kernels.h"
 #include "model.h"
 #include "sample.h"
 #include "tokenizer.h"
@@ -688,6 +689,16 @@ int cmd_generate(const GenOpts& o) {
 int main(int argc, char** argv) {
     if (argc < 2) { print_usage(); return 2; }
     const std::string cmd = argv[1];
+
+    // Defaults for the compute path; every command can override with --threads/--impl.
+    {
+        const char* t = std::getenv("ZEN_THREADS");
+        zen::set_threads(t ? std::atoi(t) : 1);
+        const char* im = std::getenv("ZEN_IMPL");
+        zen::set_impl(zen::cpu_has_avx2() ? zen::Impl::Avx2 : zen::Impl::Scalar);
+        if (im && std::strcmp(im, "scalar") == 0) zen::set_impl(zen::Impl::Scalar);
+        if (im && std::strcmp(im, "avx2") == 0) zen::set_impl(zen::Impl::Avx2);
+    }
     try {
         if (cmd == "inspect") {
             if (argc < 3) { print_usage(); return 2; }
@@ -752,6 +763,11 @@ int main(int argc, char** argv) {
                 else if (a == "--text-out") text_out = value();
                 else if (a == "--all") all = true;
                 else if (a == "--cache") use_cache = true;
+                else if (a == "--threads") zen::set_threads(std::atoi(value().c_str()));
+                else if (a == "--impl") {
+                    const std::string v = value();
+                    zen::set_impl(v == "scalar" ? zen::Impl::Scalar : zen::Impl::Avx2);
+                }
                 else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown flag " + a);
                 else model_path = a;
             }
@@ -780,6 +796,11 @@ int main(int argc, char** argv) {
                 else if (a == "--text-out") o.text_out = value();
                 else if (a == "--no-cache") o.no_cache = true;
                 else if (a == "--json") o.json = true;
+                else if (a == "--threads") zen::set_threads(std::atoi(value().c_str()));
+                else if (a == "--impl") {
+                    const std::string v = value();
+                    zen::set_impl(v == "scalar" ? zen::Impl::Scalar : zen::Impl::Avx2);
+                }
                 else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown flag " + a);
                 else o.model = a;
             }

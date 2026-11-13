@@ -6,3 +6,6 @@ models/
 *.exe
 *.vocab
 __pycache__/
+
+# personal interview prep, not part of the project
+docs/interview-defense.md

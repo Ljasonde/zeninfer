@@ -5,6 +5,8 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "kernels.h"
+
 namespace zen {
 
 namespace {
@@ -36,12 +38,7 @@ void rmsnorm(float* out, const float* x, const float* w, int64_t n, float eps) {
 }
 
 void matvec(float* y, const float* x, const Mat& m) {
-    for (int64_t o = 0; o < m.n_out; ++o) {
-        const float* row = m.row(o);
-        double acc = 0.0;
-        for (int64_t i = 0; i < m.n_in; ++i) acc += static_cast<double>(row[i]) * x[i];
-        y[o] = static_cast<float>(acc);
-    }
+    zen::matvec_f32(y, x, m.w.data(), m.n_out, m.n_in);
 }
 
 void rope_neox(float* x, int64_t n_head, int64_t head_dim, int64_t pos, float base) {
